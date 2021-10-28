@@ -23,6 +23,8 @@ import (
 	"github.com/stoewer/go-strcase"
 )
 
+// trigger build comment
+
 type service struct {
 	Spec *openapi3.Swagger
 	Name string
