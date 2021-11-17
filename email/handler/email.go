@@ -3,20 +3,25 @@ package handler
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"strings"
 
+	"github.com/micro/micro/v3/proto/api"
 	"github.com/micro/micro/v3/service"
 	"github.com/micro/micro/v3/service/client"
 	"github.com/micro/micro/v3/service/config"
+	"github.com/micro/micro/v3/service/context/metadata"
 	"github.com/micro/micro/v3/service/errors"
 	log "github.com/micro/micro/v3/service/logger"
 	"github.com/micro/micro/v3/service/store"
 	pb "github.com/micro/services/email/proto"
 	"github.com/micro/services/pkg/tenant"
 	spampb "github.com/micro/services/spam/proto"
+	"github.com/sendgrid/sendgrid-go/helpers/eventwebhook"
 )
 
 const (
@@ -32,6 +37,7 @@ type Sent struct {
 type sendgridConf struct {
 	Key       string `json:"key"`
 	EmailFrom string `json:"email_from"`
+	PublicKey string `json:"public_key"`
 	PoolName  string `json:"ip_pool_name"`
 }
 
@@ -48,15 +54,24 @@ func NewEmailHandler(svc *service.Service) *Email {
 	if len(c.Key) == 0 {
 		log.Fatalf("Sendgrid API key not configured")
 	}
+	if len(c.PublicKey) == 0 {
+		log.Fatalf("Sendgrid public key not configured")
+	}
+	sgPublicKey, err := eventwebhook.ConvertPublicKeyBase64ToECDSA(c.PublicKey)
+	if err != nil {
+		log.Fatalf("Failed to configure public key")
+	}
 	return &Email{
 		c,
 		spampb.NewSpamService("spam", svc.Client()),
+		sgPublicKey,
 	}
 }
 
 type Email struct {
-	config  sendgridConf
-	spamSvc spampb.SpamService
+	config      sendgridConf
+	spamSvc     spampb.SpamService
+	sgPublicKey *ecdsa.PublicKey
 }
 
 func (e *Email) Send(ctx context.Context, request *pb.SendRequest, response *pb.SendResponse) error {
@@ -189,5 +204,66 @@ func (e *Email) sendEmail(ctx context.Context, req *pb.SendRequest) error {
 		return fmt.Errorf("could not send email, error: %v", string(bytes))
 	}
 
+	return nil
+}
+
+type sendgridEvent struct {
+	Email       string   `json:"email"`
+	Timestamp   int      `json:"timestamp"`
+	SmtpId      string   `json:"smtp-id"`
+	Event       string   `json:"event"`
+	Category    []string `json:"category"`
+	SgEventId   string   `json:"sg_event_id"`
+	SgMessageId string   `json:"sg_message_id"` // this is prefixed with X-Message-ID on /send response
+	Response    string   `json:"response"`
+	Attempt     string   `json:"attempt"`
+	Reason      string   `json:"reason"`
+	Status      string   `json:"status"`
+}
+
+func (e *Email) Webhook(ctx context.Context, req *api.Request, rsp *api.Response) error {
+	md, ok := metadata.FromContext(ctx)
+	if !ok {
+		log.Errorf("Missing metadata from request")
+		return errors.BadRequest("email.Webhook", "Missing headers")
+	}
+	// validate signature
+
+	ok, err := eventwebhook.VerifySignature(e.sgPublicKey, []byte(req.Body), md["X-Twilio-Email-Event-Webhook-Signature"], md["X-Twilio-Email-Event-Webhook-Timestamp"])
+	if !ok || err != nil {
+		log.Errorf("Failed to verify signature %s", err)
+		// drop
+		return nil
+	}
+	if err := e.processEvents([]byte(req.Body)); err != nil {
+		log.Errorf("Failed to process events %s", err)
+		return errors.InternalServerError("email.Webhook", "Failed to process events")
+	}
+	return nil
+}
+
+func (e *Email) processEvents(b []byte) error {
+	var events []sendgridEvent
+	if err := json.Unmarshal(b, &events); err != nil {
+		return err
+	}
+	for _, ev := range events {
+		if ev.Event != "blocked" {
+			continue
+		}
+		// lookup and store
+		parts := strings.Split(ev.SgMessageId, ".")
+		recs, err := store.Read(fmt.Sprintf("%s/%s", prefixSendgridID, parts[0]))
+		if err == store.ErrNotFound {
+			log.Warnf("Message not found for sendgrid webhook %s", ev.SgMessageId)
+			continue
+		}
+		var s Sent
+		if err := json.Unmarshal(recs[0].Value, &s); err != nil {
+			log.Errorf("Unable to unmarshal message", err)
+			continue
+		}
+		// TODO do something here to deal with senders with a high block rate
+	}
 	return nil
 }
